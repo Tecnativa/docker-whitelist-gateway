@@ -1,6 +1,10 @@
+permissions:
+  contents: read
+  packages: write
+
 name: Build, Test & Deploy
 
-"on":
+on:
   pull_request:
   push:
     branches:
@@ -35,7 +39,7 @@ jobs:
           - 5000:5000
     env:
       DOCKER_IMAGE_NAME: ${{ github.repository }}
-      DOCKERHUB_IMAGE_NAME: tecnativa/whitelist-gateway
+      # Push only on non-PR events (push to main/tags, workflow_dispatch)
       PUSH: ${{ toJSON(github.event_name != 'pull_request') }}
     steps:
       # Set up Docker Environment
@@ -53,7 +57,8 @@ jobs:
         with:
           driver-opts: network=host
           install: true
-      # Build and push
+
+      # Build and push (always) to local (test) registry
       - name: Docker meta for local images
         id: docker_meta_local
         uses: crazy-max/ghaction-docker-meta@v1
@@ -79,34 +84,27 @@ jobs:
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
           labels: ${{ steps.docker_meta_local.outputs.labels }}
           tags: ${{ steps.docker_meta_local.outputs.tags }}
-      # Next jobs only happen outside of pull requests and on main branches
-      - name: Login to DockerHub
-        if: ${{ fromJSON(env.PUSH) }}
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKERHUB_LOGIN }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Login to GitHub Container Registry
         if: ${{ fromJSON(env.PUSH) }}
-        uses: docker/login-action@v1
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ secrets.BOT_LOGIN }}
-          password: ${{ secrets.BOT_TOKEN }}
-      - name: Docker meta for public images
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Docker meta for GHCR
         if: ${{ fromJSON(env.PUSH) }}
         id: docker_meta_public
         uses: crazy-max/ghaction-docker-meta@v1
         with:
           images: |
             ghcr.io/${{ env.DOCKER_IMAGE_NAME }}
-            ${{ env.DOCKERHUB_IMAGE_NAME }}
           tag-edge: true
           tag-semver: |
             {{version}}
             {{major}}
             {{major}}.{{minor}}
-      - name: Build and push to public registry(s)
+      - name: Build and push to GHCR
         if: ${{ fromJSON(env.PUSH) }}
         uses: docker/build-push-action@v4
         with:

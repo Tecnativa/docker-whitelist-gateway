@@ -102,7 +102,7 @@ jobs:
         uses: crazy-max/ghaction-docker-meta@v1
         with:
           images: |
-            ghcr.io/${{ env.DOCKER_IMAGE_NAME }}
+            ghcr.io/tecnativa/docker-whitelist-gateway-service
           tag-edge: true
           tag-semver: |
             {{version}}

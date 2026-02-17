@@ -120,6 +120,7 @@ jobs:
             linux/arm64
           load: false
           push: true
+          provenance: false
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
           labels: ${{ steps.docker_meta_public.outputs.labels }}

@@ -14,19 +14,17 @@ A transparent TCP whitelist proxy based on iptables and asyncio.
 
 ## Why?
 
-Docker supports internal networks; but when you use them, you cannot
-open outbound connections unless the container is attached to a public
-network.
+Docker supports internal networks; but when you use them, you cannot open outbound
+connections unless the container is attached to a public network.
 
-This proxy allows selected external endpoints to be reachable from
-containers attached to restricted internal networks.
+This proxy allows selected external endpoints to be reachable from containers attached
+to restricted internal networks.
 
 Typical use cases:
 
 -   Allowing connections only to specific external APIs.
 -   Allowing limited outbound access while keeping containers isolated.
--   Whitelisting external services such as SMTP, payment gateways,
-    font/CDN APIs, etc.
+-   Whitelisting external services such as SMTP, payment gateways, font/CDN APIs, etc.
 
 ## How?
 
@@ -49,13 +47,13 @@ Unlike previous versions, this implementation:
 
 This implementation requires:
 
-``` yaml
+```yaml
 cap_add:
-  - NET_ADMIN
+    - NET_ADMIN
 ```
 
-Without this capability, the container cannot configure iptables and
-will fail at startup.
+Without this capability, the container cannot configure iptables and will fail at
+startup.
 
 ## Environment variables
 
@@ -73,33 +71,33 @@ Examples:
 
 Allow all ports (default):
 
-``` yaml
+```yaml
 environment:
-  TARGET: api.example.com
+    TARGET: api.example.com
 ```
 
 Restrict to HTTPS only:
 
-``` yaml
+```yaml
 environment:
-  TARGET: api.example.com
-  PORT: "443"
+    TARGET: api.example.com
+    PORT: "443"
 ```
 
 Multiple ports:
 
-``` yaml
+```yaml
 environment:
-  TARGET: api.example.com
-  PORT: "80 443 8080"
+    TARGET: api.example.com
+    PORT: "80 443 8080"
 ```
 
 Port ranges:
 
-``` yaml
+```yaml
 environment:
-  TARGET: ftp.example.com
-  PORT: "21 50000-51000"
+    TARGET: ftp.example.com
+    PORT: "21 50000-51000"
 ```
 
 If `PORT` is not set, all TCP ports are allowed.
@@ -108,8 +106,8 @@ If `PORT` is not set, all TCP ports are allowed.
 
 Default: `0`
 
-Set to `1` to resolve `TARGET` using the configured `NAMESERVERS`
-instead of the system resolver.
+Set to `1` to resolve `TARGET` using the configured `NAMESERVERS` instead of the system
+resolver.
 
 When enabled, DNS is refreshed periodically.
 
@@ -173,18 +171,18 @@ Set to `1` to log all connections.
 
 ## Example
 
-``` yaml
+```yaml
 services:
-  fonts_googleapis_proxy:
-    image: ghcr.io/tecnativa/docker-whitelist:latest
-    cap_add:
-      - NET_ADMIN
-    networks:
-      default:
-        aliases:
-          - fonts.googleapis.com
-      public:
-    environment:
-      TARGET: fonts.googleapis.com
-      PRE_RESOLVE: 1
+    fonts_googleapis_proxy:
+        image: ghcr.io/tecnativa/docker-whitelist:latest
+        cap_add:
+            - NET_ADMIN
+        networks:
+            default:
+                aliases:
+                    - fonts.googleapis.com
+            public:
+        environment:
+            TARGET: fonts.googleapis.com
+            PRE_RESOLVE: 1
 ```

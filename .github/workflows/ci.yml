@@ -30,7 +30,28 @@ env:
   PYTHONIOENCODING: "UTF-8"
 
 jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Install deps
+        run: poetry install --no-interaction
+
+      - name: Run pytest
+        env:
+          PYTEST_ADDOPTS: ${{ env.PYTEST_ADDOPTS }}
+        run: |
+          poetry run pytest -q --prebuild --image test:docker-whitelist-gateway ${PYTEST_ADDOPTS}
   build-push:
+    needs: [tests]
     runs-on: ubuntu-22.04
     services:
       registry:

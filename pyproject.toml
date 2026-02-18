@@ -1,6 +1,6 @@
 
 [tool.poetry]
-name = "docker-whitelist"
+name = "docker-whitelist-gateway"
 version = "0.0.0"
 description = ""
 package-mode = false

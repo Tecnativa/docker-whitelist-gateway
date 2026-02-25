@@ -15,8 +15,22 @@ def error(message, exception=None):
     raise exception
 
 
+def _run(cmd, check=True):
+    return subprocess.run(
+        cmd,
+        check=check,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _is_truthy(val: str) -> bool:
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def http_healthcheck():
-    """Use pycurl to check if the target server is still responding via proxy."""
+    """Use pycurl to check if the target server is still responding via proxy (legacy mode)."""
     import re
 
     import pycurl
@@ -24,6 +38,9 @@ def http_healthcheck():
     check_url = os.environ.get("HTTP_HEALTHCHECK_URL", "http://$TARGET/")
     check_timeout_ms = int(os.environ.get("HTTP_HEALTHCHECK_TIMEOUT_MS", 2000))
     target = os.environ.get("TARGET", "localhost")
+    if not target:
+        error("HTTP_HEALTHCHECK enabled but TARGET is empty")
+
     check_url_with_target = check_url.replace("$TARGET", target)
 
     port = re.search(r"https?://[^:]*(?::([^/]+))?", check_url_with_target)[1]
@@ -51,7 +68,7 @@ def http_healthcheck():
 
 
 def smtp_healthcheck():
-    """Use pycurl to check if the target server is still responding via proxy."""
+    """Use pycurl to check if the target server is still responding via proxy (legacy mode)."""
     import re
 
     import pycurl
@@ -60,6 +77,9 @@ def smtp_healthcheck():
     check_command = os.environ.get("SMTP_HEALTHCHECK_COMMAND", "HELP")
     check_timeout_ms = int(os.environ.get("SMTP_HEALTHCHECK_TIMEOUT_MS", 2000))
     target = os.environ.get("TARGET", "localhost")
+    if not target:
+        error("SMTP_HEALTHCHECK enabled but TARGET is empty")
+
     check_url_with_target = check_url.replace("$TARGET", target)
 
     port = re.search(r"smtp://[^:]*(?::([^/]+))?", check_url_with_target)[1]
@@ -86,16 +106,18 @@ def smtp_healthcheck():
         error("error while checking smtp connection", e)
 
 
-def process_healthcheck():
-    """Check proxy process and iptables rules exist."""
+def legacy_process_healthcheck():
+    """Legacy mode: check proxy listens and REDIRECT chain exists."""
     listen_port = int(os.environ.get("LISTEN_PORT", "15000"))
+
     try:
         with socket.create_connection(("127.0.0.1", listen_port), timeout=1.0):
             pass
     except OSError as e:
         error(f"proxy is not listening on 127.0.0.1:{listen_port}", e)
+
     try:
-        subprocess.check_output(["iptables", "-t", "nat", "-S", "WHITELIST_REDIRECT"])
+        _run(["iptables", "-t", "nat", "-S", "WHITELIST_REDIRECT"], check=True)
     except Exception as e:
         error(
             "missing iptables nat chain WHITELIST_REDIRECT (CAP_NET_ADMIN required?)", e
@@ -103,14 +125,15 @@ def process_healthcheck():
 
 
 def preresolve_healthcheck():
-    """If PRE_RESOLVE=1, ensure TARGET resolves via configured NAMESERVERS."""
-    if os.environ.get("PRE_RESOLVE", "0") in {"0", "", "false", "False"}:
+    """Legacy mode only: if PRE_RESOLVE=1, ensure TARGET resolves via configured NAMESERVERS."""
+    if not _is_truthy(os.environ.get("PRE_RESOLVE", "0")):
         return
+
     from dns.resolver import Resolver
 
     target = os.environ.get("TARGET", "")
     if not target:
-        error("TARGET is empty")
+        error("PRE_RESOLVE=1 but TARGET is empty")
 
     r = Resolver()
     r.nameservers = os.environ.get("NAMESERVERS", "8.8.8.8").split()
@@ -123,16 +146,79 @@ def preresolve_healthcheck():
         error(f"failed to resolve {target} with NAMESERVERS", e)
 
 
+def gateway_process_healthcheck():
+    """Gateway mode: verify forwarding/NAT + ipset whitelist are present."""
+    ipset_name = os.environ.get("IPSET_NAME", "whitelist")
+
+    # 1) ip_forward enabled
+    try:
+        out = _run(["sysctl", "-n", "net.ipv4.ip_forward"], check=True).stdout.strip()
+        if out != "1":
+            error(f"net.ipv4.ip_forward is {out}, expected 1")
+    except Exception as e:
+        error("failed to read net.ipv4.ip_forward", e)
+
+    # 2) ipset exists and has at least 1 entry (after first resolve)
+    try:
+        p = _run(["ipset", "list", ipset_name], check=True)
+        txt = p.stdout
+        # crude but effective: look for "Number of entries: N"
+        for line in txt.splitlines():
+            if line.lower().startswith("number of entries:"):
+                n = int(line.split(":", 1)[1].strip())
+                if n <= 0:
+                    error(
+                        f"ipset {ipset_name} exists but is empty (resolver not populated yet?)"
+                    )
+                break
+        else:
+            # If format changes, at least we know it exists.
+            pass
+    except Exception as e:
+        error(f"ipset {ipset_name} missing (did you install ipset in the image?)", e)
+
+    # 3) iptables chains created by gateway mode exist
+    # (Names match the proxy.py I sent you: WHITELIST_FWD and WHITELIST_NAT)
+    try:
+        _run(["iptables", "-t", "filter", "-S", "WHITELIST_FWD"], check=True)
+    except Exception as e:
+        error(
+            "missing iptables filter chain WHITELIST_FWD (gateway rules not installed?)",
+            e,
+        )
+
+    try:
+        _run(["iptables", "-t", "nat", "-S", "WHITELIST_NAT"], check=True)
+    except Exception as e:
+        error(
+            "missing iptables nat chain WHITELIST_NAT (gateway NAT not installed?)", e
+        )
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
 
+    target = os.environ.get("TARGET", "").strip()
+    allowed_hosts = os.environ.get("ALLOWED_HOSTS", "").strip()
+
+    # If explicit healthchecks enabled, keep them legacy-only (they rely on loopback REDIRECT).
     if os.environ.get("HTTP_HEALTHCHECK", "0") == "1":
         http_healthcheck()
-    elif os.environ.get("SMTP_HEALTHCHECK", "0") == "1":
+        print("OK")
+        return
+    if os.environ.get("SMTP_HEALTHCHECK", "0") == "1":
         smtp_healthcheck()
-    else:
-        process_healthcheck()
+        print("OK")
+        return
+
+    # Auto-select mode
+    if target:
+        legacy_process_healthcheck()
         preresolve_healthcheck()
+    elif allowed_hosts:
+        gateway_process_healthcheck()
+    else:
+        error("Neither TARGET nor ALLOWED_HOSTS set; cannot determine mode")
 
     print("OK")
 

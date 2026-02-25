@@ -257,4 +257,7 @@ dmypy.json
 !.vscode/extensions.json
 *.code-workspace
 
+### pycharm ###
+.idea/*
+
 # End of https://www.toptal.com/developers/gitignore/api/vscode,python,node

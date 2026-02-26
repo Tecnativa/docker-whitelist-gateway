@@ -1,188 +1,214 @@
-[![Last image-template](https://img.shields.io/badge/last%20template%20update-v0.1.3-informational)](https://github.com/Tecnativa/image-template/tree/v0.1.3)
-[![GitHub Container Registry](https://img.shields.io/badge/GitHub%20Container%20Registry-latest-%2324292e)](https://github.com/orgs/Tecnativa/packages/container/package/docker-whitelist)
-[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-latest-%23099cec)](https://hub.docker.com/r/tecnativa/whitelist)
-[![Docker Pulls](https://img.shields.io/docker/pulls/tecnativa/whitelist.svg)](https://hub.docker.com/r/tecnativa/whitelist)
-[![Layers](https://images.microbadger.com/badges/image/tecnativa/whitelist.svg)](https://microbadger.com/images/tecnativa/whitelist)
-[![Commit](https://images.microbadger.com/badges/commit/tecnativa/whitelist.svg)](https://microbadger.com/images/tecnativa/whitelist)
-[![License](https://images.microbadger.com/badges/license/tecnativa/whitelist.svg)](https://microbadger.com/images/tecnativa/whitelist)
+# Docker Whitelist Gateway (Multi-Destination Edition)
 
-# Docker Whitelister
+A transparent outbound firewall + DNS gateway for Docker internal networks.
 
-## What?
+This project allows containers attached to **internal (isolated) Docker networks** to
+reach selected external destinations while keeping all other outbound traffic blocked.
 
-A transparent TCP whitelist proxy based on iptables and asyncio.
+Unlike classic single-target whitelist proxies, this implementation supports:
 
-## Why?
+-   Multiple external destinations (multi-destination)
+-   Dynamic DNS resolution
+-   Automatic subnet detection (no fixed IP configuration)
+-   Internal service resolution preservation
+-   Transparent TCP forwarding using iptables + asyncio
 
-Docker supports internal networks; but when you use them, you cannot open outbound
-connections unless the container is attached to a public network.
+---
 
-This proxy allows selected external endpoints to be reachable from containers attached
-to restricted internal networks.
+## Architecture Overview
 
-Typical use cases:
+The gateway is designed for environments where:
 
--   Allowing connections only to specific external APIs.
--   Allowing limited outbound access while keeping containers isolated.
--   Whitelisting external services such as SMTP, payment gateways, font/CDN APIs, etc.
+-   The main service runs in a Docker **internal network**
+-   Outbound internet access must be restricted
+-   Only specific domains/IPs should be reachable
+-   Internal service discovery must keep working
 
-## How?
+The architecture typically uses two containers:
 
-The proxy works by:
+1.  **gateway container**
+    -   Runs iptables rules
+    -   Runs async TCP forwarder
+    -   Runs controlled DNS (dnsmasq)
+    -   Whitelists allowed destinations
+2.  **net_setup sidecar (optional but recommended)**
+    -   Shares network namespace with the main service
+    -   Rewrites default route to gateway
+    -   Rewrites /etc/resolv.conf to use gateway DNS
 
--   Installing iptables NAT REDIRECT rules (requires `CAP_NET_ADMIN`)
--   Running a single TCP listener
--   Redirecting inbound traffic to that listener
--   Recovering the original destination port using `SO_ORIGINAL_DST`
--   Forwarding traffic to `TARGET:<original_port>`
+---
 
-Unlike previous versions, this implementation:
+## How It Works
 
--   Does not spawn one process per port
--   Uses a single async TCP server
--   Scales better under load
--   Handles DNS refresh more reliably
+### Traffic Redirection
 
-## Required capability
+The gateway:
 
-This implementation requires:
+-   Installs NAT REDIRECT rules
+-   Captures outbound TCP traffic
+-   Recovers original destination using `SO_ORIGINAL_DST`
+-   Forwards only if destination is allowed
+
+All other outbound traffic is dropped.
+
+---
+
+### Controlled DNS
+
+When the main container switches its resolver to the gateway:
+
+-   Internal Docker names must still resolve
+-   External domains must be filtered
+
+The gateway:
+
+-   Uses Docker DNS to resolve internal services
+-   Runs dnsmasq for controlled external resolution
+-   Returns `0.0.0.0` for non-allowed domains
+
+Allowed example:
+
+    transfer.einsamobile.de → 194.26.180.120
+
+Blocked example:
+
+    www.google.com → 0.0.0.0
+
+---
+
+## Required Capability
 
 ```yaml
 cap_add:
     - NET_ADMIN
 ```
 
-Without this capability, the container cannot configure iptables and will fail at
-startup.
+---
 
-## Environment variables
+## Environment Variables
 
-### TARGET
+### ALLOWED_HOSTS (Required)
 
-Required. Hostname where incoming connections will be forwarded.
+Space-separated list of domains or IPs allowed for outbound access.
+
+```yaml
+environment:
+    ALLOWED_HOSTS: "api.example.com smtp.example.com 1.2.3.4"
+```
+
+---
 
 ### PORT
 
-Default: `*` (all TCP ports allowed)
+Default: `*`
 
-Defines which TCP ports are redirected and proxied.
+Defines allowed TCP ports.
 
 Examples:
 
-Allow all ports (default):
-
 ```yaml
-environment:
-    TARGET: api.example.com
+PORT: "443"
+PORT: "80 443 8080"
+PORT: "21 50000-51000"
 ```
 
-Restrict to HTTPS only:
-
-```yaml
-environment:
-    TARGET: api.example.com
-    PORT: "443"
-```
-
-Multiple ports:
-
-```yaml
-environment:
-    TARGET: api.example.com
-    PORT: "80 443 8080"
-```
-
-Port ranges:
-
-```yaml
-environment:
-    TARGET: ftp.example.com
-    PORT: "21 50000-51000"
-```
-
-If `PORT` is not set, all TCP ports are allowed.
+---
 
 ### PRE_RESOLVE
 
 Default: `0`
 
-Set to `1` to resolve `TARGET` using the configured `NAMESERVERS` instead of the system
-resolver.
+When enabled (`1`):
 
-When enabled, DNS is refreshed periodically.
+-   The gateway resolves allowed domains itself
+-   Refreshes periodically
+-   Avoids dependency on system DNS
+
+---
 
 ### RESOLVE_INTERVAL
 
 Default: `60`
 
-Interval in seconds to refresh DNS resolution when `PRE_RESOLVE=1`.
+DNS refresh interval in seconds when `PRE_RESOLVE=1`.
 
-If the IP changes, new connections automatically use the new address.
+---
 
-### NAMESERVERS
+### DNS_UPSTREAMS
 
-Default: 208.67.222.222 8.8.8.8 208.67.220.220 8.8.4.4
+Default: `1.1.1.1 8.8.8.8`
 
-Used only when `PRE_RESOLVE=1`.
+Upstream DNS servers used by dnsmasq.
 
-### LISTEN_PORT
+---
 
-Default: `15000`
+### DNS_INTERNAL_NAMES
 
-Internal port where the proxy listens after iptables redirection.
+Optional.
 
-### HTTP_HEALTHCHECK
+Defines internal Docker service names that must always resolve.
 
-Default: `0`
+Example:
 
-Set to `1` to enable HTTP-based healthcheck using pycurl.
+```yaml
+DNS_INTERNAL_NAMES: "db smtp redis backend gateway"
+```
 
-### HTTP_HEALTHCHECK_URL
+Only required if the gateway replaces Docker's default resolver and you want
+deterministic internal resolution.
 
-Default: `http://$TARGET/`
+---
 
-### HTTP_HEALTHCHECK_TIMEOUT_MS
-
-Default: `2000`
-
-### SMTP_HEALTHCHECK
-
-Default: `0`
-
-Set to `1` to enable SMTP healthcheck using pycurl.
-
-### SMTP_HEALTHCHECK_URL
-
-Default: `smtp://$TARGET/`
-
-### SMTP_HEALTHCHECK_COMMAND
-
-Default: `HELP`
-
-### SMTP_HEALTHCHECK_TIMEOUT_MS
-
-Default: `2000`
-
-### VERBOSE
-
-Default: `0`
-
-Set to `1` to log all connections.
-
-## Example
+## Multi-Destination Example (Generic Service)
 
 ```yaml
 services:
-    fonts_googleapis_proxy:
-        image: ghcr.io/tecnativa/docker-whitelist:latest
+    app:
+        image: my-app
+        networks:
+            - internal
+        cap_add:
+            - NET_ADMIN
+        depends_on:
+            - gateway
+
+    net_setup:
+        image: docker-whitelist-gateway:latest
+        network_mode: "service:app"
+        cap_add:
+            - NET_ADMIN
+        environment:
+            MODE_RUN: net_setup
+            GATEWAY_NAME: gateway
+
+    gateway:
+        image: docker-whitelist-gateway:latest
         cap_add:
             - NET_ADMIN
         networks:
-            default:
-                aliases:
-                    - fonts.googleapis.com
-            public:
+            - internal
+            - public
         environment:
-            TARGET: fonts.googleapis.com
+            ALLOWED_HOSTS: "api.stripe.com smtp.mailgun.org ftp.partner.com"
             PRE_RESOLVE: 1
+
+networks:
+    internal:
+        internal: true
+    public:
 ```
+
+---
+
+## Summary
+
+Docker Whitelist Gateway provides:
+
+-   Transparent outbound filtering
+-   DNS-level control
+-   Multi-destination support
+-   Automatic dynamic routing
+-   Clean separation between service and firewall logic
+
+It is designed for secure containerized environments where outbound access must be
+explicitly controlled.

@@ -94,78 +94,57 @@ EOF
 }
 
 net_setup_mode() {
-  : "${GATEWAY_NAME:=proxy_general}"
+  set -eu
+  : "${GATEWAY_NAME:?Missing GATEWAY_NAME}"
 
-  log "MODE_RUN=net_setup"
-  log "GATEWAY_NAME=$GATEWAY_NAME"
+  echo "INFO: net_setup_mode: waiting for gateway DNS..."
 
-  # Pick Odoo interface: first non-lo iface with an IPv4
-  DEFAULT_DEV="$(ip -o -4 addr show | awk '$2!="lo"{print $2; exit}' || true)"
-  if [ -z "$DEFAULT_DEV" ]; then
-    log "ERROR: cannot determine Odoo iface with IPv4"
-    ip -o -4 addr show || true
-    exit 1
-  fi
-
-  # CIDR of that iface (e.g. 172.28.0.7/16)
-  ODOO_CIDR="$(ip -o -4 addr show dev "$DEFAULT_DEV" | awk '{print $4}' | head -n1 || true)"
-  if [ -z "$ODOO_CIDR" ]; then
-    log "ERROR: cannot determine Odoo IPv4 CIDR on dev=$DEFAULT_DEV"
-    ip -o -4 addr show dev "$DEFAULT_DEV" || true
-    exit 1
-  fi
-
-  log "ODOO_DEV=$DEFAULT_DEV"
-  log "ODOO_CIDR=$ODOO_CIDR"
-
-  GW_IP=""
-  for i in $(seq 1 60); do
-    GW_IP="$(
-      getent hosts "$GATEWAY_NAME" 2>/dev/null | awk '{print $1}' | \
-      python3 -c '
-import ipaddress, sys
-
-net = ipaddress.ip_network(sys.argv[1], strict=False)
-
-for line in sys.stdin:
-    ip = line.strip()
-    if not ip:
-        continue
-    try:
-        if ipaddress.ip_address(ip) in net:
-            print(ip)
-            break
-    except Exception:
-        pass
-' "$ODOO_CIDR"
-    )"
-
-    if [ -n "$GW_IP" ]; then
-      log "Gateway resolved (same subnet) to $GW_IP"
-      break
-    fi
-
-    log "Waiting for $GATEWAY_NAME DNS..."
-    sleep 1
+  # Wait until gateway resolves
+  for i in $(seq 1 30); do
+    GW_IP="$(getent ahostsv4 "$GATEWAY_NAME" | awk '{print $1; exit}' || true)"
+    [ -n "$GW_IP" ] && break
+    sleep 3
   done
 
-  if [ -z "$GW_IP" ]; then
-    log "ERROR: $GATEWAY_NAME not resolvable in Odoo subnet $ODOO_CIDR"
-    log "DEBUG getent:"
-    getent hosts "$GATEWAY_NAME" || true
-    log "DEBUG ip addr:"
-    ip -o -4 addr show || true
+  if [ -z "${GW_IP:-}" ]; then
+    echo "ERROR: cannot resolve $GATEWAY_NAME"
     exit 1
   fi
 
-  ip route replace default via "$GW_IP"
-  log "Default route set via $GW_IP"
+  echo "INFO: gateway resolved to $GW_IP"
 
-  printf "nameserver %s\noptions ndots:0\n" "$GW_IP" > /etc/resolv.conf
-  log "DNS set to $GW_IP"
-  cat /etc/resolv.conf || true
+  # Wait until gateway answers ping (network ready)
+  for i in $(seq 1 30); do
+    if ping -c1 -W1 "$GW_IP" >/dev/null 2>&1; then
+      break
+    fi
+    echo "INFO: waiting for gateway network readiness..."
+    sleep 3
+  done
 
-  sleep infinity
+  echo "INFO: selecting correct iface for gateway..."
+
+  # Detect iface used to reach gateway
+  ODOO_DEV="$(ip -4 route get "$GW_IP" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+
+  if [ -z "${ODOO_DEV:-}" ]; then
+    echo "ERROR: could not detect interface to reach gateway"
+    exit 1
+  fi
+
+  echo "INFO: chosen iface=$ODOO_DEV"
+
+  ip route replace default via "$GW_IP" dev "$ODOO_DEV"
+
+  {
+    echo "nameserver $GW_IP"
+    echo "options ndots:0"
+  } > /etc/resolv.conf
+
+  echo "INFO: default route and DNS configured successfully"
+
+  # Keep container alive without busy looping
+  tail -f /dev/null
 }
 
 : "${MODE_RUN:=gateway}"

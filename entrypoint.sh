@@ -136,11 +136,6 @@ net_setup_mode() {
 
   ip route replace default via "$GW_IP" dev "$ODOO_DEV"
 
-  {
-    echo "nameserver $GW_IP"
-    echo "options ndots:0"
-  } > /etc/resolv.conf
-
   echo "INFO: default route and DNS configured successfully"
 
   # Keep container alive without busy looping

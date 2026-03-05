@@ -79,6 +79,7 @@ no-resolv
 domain-needed
 bogus-priv
 cache-size=1000
+filter-aaaa
 
 # Default: block everything NXDOMAIN
 EOF

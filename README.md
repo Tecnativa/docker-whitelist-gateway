@@ -1,214 +1,361 @@
-# Docker Whitelist Gateway (Multi-Destination Edition)
+# Docker Whitelist Gateway
 
-A transparent outbound firewall + DNS gateway for Docker internal networks.
+Outbound network gateway + filtered DNS for Docker application stacks.
 
-This project allows containers attached to **internal (isolated) Docker networks** to
-reach selected external destinations while keeping all other outbound traffic blocked.
+This project lets application containers reach only a defined set of external hosts
+while preserving internal Docker service resolution.
 
-Unlike classic single-target whitelist proxies, this implementation supports:
+It is intended for stacks where:
 
--   Multiple external destinations (multi-destination)
--   Dynamic DNS resolution
--   Automatic subnet detection (no fixed IP configuration)
--   Internal service resolution preservation
--   Transparent TCP forwarding using iptables + asyncio
-
----
-
-## Architecture Overview
-
-The gateway is designed for environments where:
-
--   The main service runs in a Docker **internal network**
--   Outbound internet access must be restricted
--   Only specific domains/IPs should be reachable
--   Internal service discovery must keep working
-
-The architecture typically uses two containers:
-
-1.  **gateway container**
-    -   Runs iptables rules
-    -   Runs async TCP forwarder
-    -   Runs controlled DNS (dnsmasq)
-    -   Whitelists allowed destinations
-2.  **net_setup sidecar (optional but recommended)**
-    -   Shares network namespace with the main service
-    -   Rewrites default route to gateway
-    -   Rewrites /etc/resolv.conf to use gateway DNS
+-   the main application should not have unrestricted outbound internet access
+-   only specific external domains or IPs should be reachable
+-   internal Docker service names must continue to resolve normally
+-   the application may already be attached to multiple Docker networks
 
 ---
 
-## How It Works
+## Current architecture
 
-### Traffic Redirection
+The current setup uses **two helper containers** plus a **dedicated transit network**:
 
-The gateway:
+1. **gateway container**
 
--   Installs NAT REDIRECT rules
--   Captures outbound TCP traffic
--   Recovers original destination using `SO_ORIGINAL_DST`
--   Forwards only if destination is allowed
+    - runs in `MODE_RUN=gateway`
+    - enables IPv4 forwarding
+    - installs `iptables` + `ipset` rules
+    - performs outbound NAT/masquerading
+    - periodically resolves allowed hosts and refreshes the whitelist
 
-All other outbound traffic is dropped.
+2. **net_setup sidecar**
 
----
+    - runs in `MODE_RUN=net_setup`
+    - shares the network namespace of the main application container
+    - rewrites the default route so traffic exits through the gateway
+    - can start a local `dnsmasq` on `127.0.0.1`
+    - can generate internal DNS entries automatically from Docker metadata
 
-### Controlled DNS
+3. **dedicated non-internal transit network**
 
-When the main container switches its resolver to the gateway:
+    - shared by the app and the gateway
+    - used only for routed traffic between the app and the gateway
+    - **must not be declared as `internal: true`**
 
--   Internal Docker names must still resolve
--   External domains must be filtered
+A typical production layout is:
 
-The gateway:
-
--   Uses Docker DNS to resolve internal services
--   Runs dnsmasq for controlled external resolution
--   Returns `0.0.0.0` for non-allowed domains
-
-Allowed example:
-
-    transfer.einsamobile.de → 194.26.180.120
-
-Blocked example:
-
-    www.google.com → 0.0.0.0
+-   an **internal app network** for app ↔ db ↔ smtp internal traffic
+-   a **transit network** for app ↔ gateway traffic
+-   a **public network** for gateway ↔ internet traffic
 
 ---
 
-## Required Capability
+## Important network design rule
+
+The gateway must **not** be used through a Docker network marked as `internal: true`.
+
+Docker isolates internal bridges at host level, so traffic destined outside that subnet
+may be dropped before it ever reaches the gateway container.
+
+Therefore:
+
+-   keep your app's private/internal network internal if you want
+-   add a **separate non-internal network** for app → gateway transit
+-   connect the gateway to:
+    -   the transit network
+    -   the public/outbound network
+-   do **not** rely on the internal app network as the routed gateway path
+
+---
+
+## How it works
+
+### Outbound traffic filtering
+
+The gateway container maintains an `ipset` containing:
+
+-   IPs resolved from domain names listed in `ALLOWED_HOSTS`
+-   literal IPs listed directly in `ALLOWED_HOSTS`
+
+Outbound traffic is allowed only when the destination IP is present in that set.
+
+The gateway installs rules that:
+
+-   allow `RELATED,ESTABLISHED`
+-   allow traffic from any **non-external** interface to the external interface when
+    destination IP is in the whitelist ipset
+-   reject traffic from any **non-external** interface to the external interface when
+    destination IP is **not** in the whitelist
+-   masquerade/NAT traffic leaving the external interface
+
+This means the application can still resolve many names, but it can only connect
+successfully to destinations whose **current IPs** are whitelisted.
+
+---
+
+### DNS behavior
+
+There are two DNS layers.
+
+#### 1. Local app DNS (inside the app namespace)
+
+When `DNS_LOCAL=1` is enabled in `net_setup`:
+
+-   `dnsmasq` listens on `127.0.0.1`
+-   `/etc/resolv.conf` is rewritten to use `127.0.0.1`
+-   internal Docker service names are served from an autogenerated hosts file
+-   external names are forwarded to Docker's embedded resolver at `127.0.0.11`
+
+This is intentional:
+
+-   internal service names stay stable and local
+-   external name resolution remains compatible with real-world CNAME chains/CDNs
+-   the real outbound restriction is enforced by the gateway firewall, not by DNS alone
+
+#### 2. Internal Docker service resolution
+
+Internal names are generated automatically from Docker metadata when
+`DNS_INTERNAL_FROM_DOCKER=1` is enabled.
+
+The sidecar creates `/run/dnsmasq-internal.hosts` using the Docker socket and Compose
+metadata.
+
+This typically includes:
+
+-   Compose service names (`db`, `smtp`, `app`, etc.)
+-   explicit network aliases (`smtprelay`, `main-db`, etc.)
+-   useful container names when applicable
+
+This preserves internal service discovery without requiring manual maintenance of
+internal DNS entries.
+
+---
+
+## Required capability
+
+Both helper containers need:
 
 ```yaml
 cap_add:
     - NET_ADMIN
 ```
 
----
-
-## Environment Variables
-
-### ALLOWED_HOSTS (Required)
-
-Space-separated list of domains or IPs allowed for outbound access.
+The `net_setup` sidecar also needs the Docker socket when automatic internal DNS entries
+are enabled:
 
 ```yaml
-environment:
-    ALLOWED_HOSTS: "api.example.com smtp.example.com 1.2.3.4"
+volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+```
+
+The gateway should also enable IPv4 forwarding explicitly:
+
+```yaml
+sysctls:
+    net.ipv4.ip_forward: "1"
 ```
 
 ---
 
-### PORT
+## Environment variables
 
-Default: `*`
+### Common
 
-Defines allowed TCP ports.
+#### `ALLOWED_HOSTS` (required)
 
-Examples:
-
-```yaml
-PORT: "443"
-PORT: "80 443 8080"
-PORT: "21 50000-51000"
-```
-
----
-
-### PRE_RESOLVE
-
-Default: `0`
-
-When enabled (`1`):
-
--   The gateway resolves allowed domains itself
--   Refreshes periodically
--   Avoids dependency on system DNS
-
----
-
-### RESOLVE_INTERVAL
-
-Default: `60`
-
-DNS refresh interval in seconds when `PRE_RESOLVE=1`.
-
----
-
-### DNS_UPSTREAMS
-
-Default: `1.1.1.1 8.8.8.8`
-
-Upstream DNS servers used by dnsmasq.
-
----
-
-### DNS_INTERNAL_NAMES
-
-Optional.
-
-Defines internal Docker service names that must always resolve.
+Space-separated list of allowed external domains and/or IPs.
 
 Example:
 
 ```yaml
-DNS_INTERNAL_NAMES: "db smtp redis backend gateway"
+ALLOWED_HOSTS: "api.partner.invalid files.vendor.invalid 203.0.113.25"
 ```
 
-Only required if the gateway replaces Docker's default resolver and you want
-deterministic internal resolution.
+Notes:
+
+-   domain names are resolved periodically by the gateway and added to the whitelist
+-   literal IPs are added directly to the whitelist
+-   DNS resolution alone does **not** imply connectivity; connectivity is still
+    controlled by gateway firewall rules
 
 ---
 
-## Multi-Destination Example (Generic Service)
+### Gateway mode
+
+#### `MODE_RUN=gateway`
+
+Runs the container as the outbound network gateway.
+
+Optional:
+
+```yaml
+IPSET_NAME: "whitelist"
+REFRESH_INTERVAL: "300"
+```
+
+-   `IPSET_NAME`: name of the whitelist ipset
+-   `REFRESH_INTERVAL`: refresh interval in seconds for resolving allowed hosts
+
+The gateway automatically detects its external interface from the default route.
+Firewall rules are applied dynamically so the setup is resilient even when the container
+is attached to multiple Docker networks.
+
+---
+
+### Net setup mode
+
+#### `MODE_RUN=net_setup`
+
+Runs the container as the sidecar that configures routing and DNS for the main app.
+
+Required:
+
+```yaml
+GATEWAY_NAME: "gateway"
+```
+
+This must resolve to the gateway container on the shared **transit** network.
+
+Optional:
+
+```yaml
+DNS_LOCAL: "1"
+DNS_INTERNAL_FROM_DOCKER: "1"
+DOCKER_PROJECT: "acme-portal"
+DOCKER_PRIMARY_SERVICE: "app"
+DNS_DOCKER_REFRESH_INTERVAL: "5"
+DNS_UPSTREAMS_LOCAL: "127.0.0.11"
+```
+
+-   `DNS_LOCAL=1`: enable local `dnsmasq` inside the app namespace
+-   `DNS_INTERNAL_FROM_DOCKER=1`: generate internal DNS entries from Docker metadata
+-   `DOCKER_PROJECT`: Compose project name used to discover related containers
+-   `DOCKER_PRIMARY_SERVICE`: main service whose visible networks define DNS scope
+-   `DNS_DOCKER_REFRESH_INTERVAL`: refresh interval for autogenerated internal hosts
+-   `DNS_UPSTREAMS_LOCAL`: upstream resolvers used by local `dnsmasq` (default:
+    `127.0.0.11`)
+
+---
+
+## Recommended Compose layout
+
+Example with fake project names and fake external domains:
 
 ```yaml
 services:
     app:
-        image: my-app
+        image: registry.example.invalid/acme/app:latest
         networks:
-            - internal
-        cap_add:
-            - NET_ADMIN
-        depends_on:
-            - gateway
+            app_internal:
+            gateway_transit:
+        environment:
+            DB_HOST: main-db
+            SMTP_SERVER: smtprelay
 
     net_setup:
-        image: docker-whitelist-gateway:latest
+        image: ghcr.io/example/docker-whitelist-gateway:latest
         network_mode: "service:app"
         cap_add:
             - NET_ADMIN
+        volumes:
+            - /var/run/docker.sock:/var/run/docker.sock:ro
         environment:
-            MODE_RUN: net_setup
-            GATEWAY_NAME: gateway
+            MODE_RUN: "net_setup"
+            GATEWAY_NAME: "gateway"
+            DNS_LOCAL: "1"
+            DNS_INTERNAL_FROM_DOCKER: "1"
+            DOCKER_PROJECT: "acme-portal"
+            DOCKER_PRIMARY_SERVICE: "app"
+            ALLOWED_HOSTS: "api.partner.invalid files.vendor.invalid 203.0.113.25"
 
     gateway:
-        image: docker-whitelist-gateway:latest
+        image: ghcr.io/example/docker-whitelist-gateway:latest
         cap_add:
             - NET_ADMIN
+        sysctls:
+            net.ipv4.ip_forward: "1"
         networks:
-            - internal
-            - public
+            gateway_transit:
+                aliases:
+                    - gateway
+            public:
         environment:
-            ALLOWED_HOSTS: "api.stripe.com smtp.mailgun.org ftp.partner.com"
-            PRE_RESOLVE: 1
+            MODE_RUN: "gateway"
+            ALLOWED_HOSTS: "api.partner.invalid files.vendor.invalid 203.0.113.25"
+
+    db:
+        image: postgres:17
+        networks:
+            app_internal:
+                aliases:
+                    - main-db
+
+    smtp:
+        image: mailhog/mailhog
+        networks:
+            app_internal:
+                aliases:
+                    - smtprelay
 
 networks:
-    internal:
+    app_internal:
         internal: true
+
+    gateway_transit:
+
     public:
 ```
 
+### Why this layout works
+
+-   `app_internal` remains private/internal
+-   `gateway_transit` carries routed traffic from `app` to `gateway`
+-   `public` is used only by the gateway for outbound access
+-   internal service names such as `main-db` and `smtprelay` still resolve locally
+-   only destinations listed in `ALLOWED_HOSTS` are reachable externally
+
 ---
 
-## Summary
+## Example behavior
 
-Docker Whitelist Gateway provides:
+With:
 
--   Transparent outbound filtering
--   DNS-level control
--   Multi-destination support
--   Automatic dynamic routing
--   Clean separation between service and firewall logic
+```yaml
+ALLOWED_HOSTS: "api.partner.invalid files.vendor.invalid"
+```
 
-It is designed for secure containerized environments where outbound access must be
-explicitly controlled.
+Expected behavior:
+
+-   `getent hosts api.partner.invalid` → may resolve
+-   `curl https://api.partner.invalid` → allowed
+-   `getent hosts random-site.example.invalid` → may resolve
+-   `curl https://random-site.example.invalid` → blocked by gateway
+-   `getent hosts main-db` → resolves locally
+-   `getent hosts smtprelay` → resolves locally
+
+This is expected: **DNS resolution and outbound permission are intentionally separate
+concerns**.
+
+---
+
+## Current behavior summary
+
+This implementation now provides:
+
+-   outbound filtering based on destination IP whitelist
+-   periodic refresh of allowed destination IPs
+-   local DNS for the application namespace
+-   automatic internal Docker name resolution from Docker metadata
+-   compatibility with multi-network application containers
+-   no need to maintain `DNS_INTERNAL_NAMES` manually in normal Compose setups
+-   correct routing through a dedicated non-internal transit network
+
+---
+
+## Notes
+
+-   The transit network used between app and gateway must not be Docker-internal.
+-   The gateway healthcheck should validate the current chain-based `iptables` setup.
+-   Internal DNS generation depends on the Docker socket and Compose metadata.
+-   DNS may resolve names that are not ultimately reachable; the gateway firewall is the
+    actual enforcement point.
+-   For CDN-backed services, consider a shorter `REFRESH_INTERVAL` if target IPs rotate
+    often.

@@ -158,41 +158,87 @@ def gateway_process_healthcheck():
     except Exception as e:
         error("failed to read net.ipv4.ip_forward", e)
 
-    # 2) ipset exists and has at least 1 entry (after first resolve)
+    # 2) ipset exists and has entries
     try:
         p = _run(["ipset", "list", ipset_name], check=True)
         txt = p.stdout
-        # crude but effective: look for "Number of entries: N"
+        found_count = False
         for line in txt.splitlines():
             if line.lower().startswith("number of entries:"):
+                found_count = True
                 n = int(line.split(":", 1)[1].strip())
                 if n <= 0:
                     error(
                         f"ipset {ipset_name} exists but is empty (resolver not populated yet?)"
                     )
                 break
-        else:
-            # If format changes, at least we know it exists.
-            pass
+        if not found_count:
+            error(f"could not determine number of entries for ipset {ipset_name}")
     except Exception as e:
         error(f"ipset {ipset_name} missing (did you install ipset in the image?)", e)
 
-    # 3) iptables chains created by gateway mode exist
-    # (Names match the proxy.py I sent you: WHITELIST_FWD and WHITELIST_NAT)
+    # 3) FORWARD must jump to WHITELIST_FWD
     try:
-        _run(["iptables", "-t", "filter", "-S", "WHITELIST_FWD"], check=True)
+        out = _run(["iptables", "-t", "filter", "-S", "FORWARD"], check=True).stdout
+        expected = "-A FORWARD -j WHITELIST_FWD"
+        if expected not in out:
+            error(
+                f"missing jump from FORWARD to WHITELIST_FWD " f"(expected: {expected})"
+            )
     except Exception as e:
-        error(
-            "missing iptables filter chain WHITELIST_FWD (gateway rules not installed?)",
-            e,
-        )
+        error("failed to inspect iptables filter/FORWARD rules", e)
 
+    # 4) WHITELIST_FWD must allow established/related
     try:
-        _run(["iptables", "-t", "nat", "-S", "WHITELIST_NAT"], check=True)
+        out = _run(
+            ["iptables", "-t", "filter", "-S", "WHITELIST_FWD"], check=True
+        ).stdout
+        expected_fragment = "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        if expected_fragment not in out:
+            error(
+                "missing RELATED,ESTABLISHED rule in WHITELIST_FWD "
+                f"(expected fragment: {expected_fragment})"
+            )
     except Exception as e:
-        error(
-            "missing iptables nat chain WHITELIST_NAT (gateway NAT not installed?)", e
-        )
+        error("failed to inspect WHITELIST_FWD chain", e)
+
+    # 5) WHITELIST_FWD must allow whitelist ipset destinations
+    try:
+        out = _run(
+            ["iptables", "-t", "filter", "-S", "WHITELIST_FWD"], check=True
+        ).stdout
+        expected_fragment = f"-m set --match-set {ipset_name} dst -j ACCEPT"
+        if expected_fragment not in out:
+            error(
+                f"missing whitelist ACCEPT rule in WHITELIST_FWD "
+                f"(expected fragment: {expected_fragment})"
+            )
+    except Exception as e:
+        error("failed to inspect whitelist ACCEPT rule in WHITELIST_FWD", e)
+
+    # 6) POSTROUTING must jump to WHITELIST_NAT
+    try:
+        out = _run(["iptables", "-t", "nat", "-S", "POSTROUTING"], check=True).stdout
+        expected = "-A POSTROUTING -j WHITELIST_NAT"
+        if expected not in out:
+            error(
+                f"missing jump from POSTROUTING to WHITELIST_NAT "
+                f"(expected: {expected})"
+            )
+    except Exception as e:
+        error("failed to inspect iptables nat/POSTROUTING rules", e)
+
+    # 7) WHITELIST_NAT must contain MASQUERADE
+    try:
+        out = _run(["iptables", "-t", "nat", "-S", "WHITELIST_NAT"], check=True).stdout
+        expected_fragment = "-j MASQUERADE"
+        if expected_fragment not in out:
+            error(
+                f"missing MASQUERADE rule in WHITELIST_NAT "
+                f"(expected fragment: {expected_fragment})"
+            )
+    except Exception as e:
+        error("failed to inspect WHITELIST_NAT chain", e)
 
 
 def main():

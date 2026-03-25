@@ -483,6 +483,10 @@ def _ipset_create(name: str) -> None:
     _run(["ipset", "create", name, "hash:ip", "-exist"], check=True)
 
 
+def _ipset_add(name: str, ip: str) -> None:
+    _run(["ipset", "add", name, ip, "-exist"], check=True)
+
+
 def _ipset_swap(tmp: str, main: str) -> None:
     _run(["ipset", "swap", tmp, main], check=True)
 
@@ -526,15 +530,15 @@ def _resolve_allowed_hosts(
     return ips
 
 
-def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> None:
+def _install_gateway_rules(*, outside: str, ipset_name: str) -> None:
     """
     Rules:
     - NAT: MASQUERADE traffic leaving outside iface
     - FILTER/FORWARD:
         * accept ESTABLISHED,RELATED
         * optionally accept DNS to outside (FORWARD_DNS=1)
-        * accept inside->outside if dst in ipset whitelist
-        * reject inside->outside otherwise
+        * accept any non-outside -> outside if dst in ipset whitelist
+        * reject any non-outside -> outside otherwise
     """
     nat_chain = "WHITELIST_NAT"
     _iptables_prepare_chain_postrouting(nat_chain)
@@ -572,8 +576,9 @@ def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> Non
                 "filter",
                 "-A",
                 fwd_chain,
+                "!",
                 "-i",
-                inside,
+                outside,
                 "-o",
                 outside,
                 "-p",
@@ -592,8 +597,9 @@ def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> Non
                 "filter",
                 "-A",
                 fwd_chain,
+                "!",
                 "-i",
-                inside,
+                outside,
                 "-o",
                 outside,
                 "-p",
@@ -605,7 +611,9 @@ def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> Non
             ],
             check=True,
         )
-        _LOG.info("FORWARD_DNS=1 -> allowing inside->outside DNS queries directly")
+        _LOG.info(
+            "FORWARD_DNS=1 -> allowing non-outside -> outside DNS queries directly"
+        )
 
     _run(
         [
@@ -614,8 +622,9 @@ def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> Non
             "filter",
             "-A",
             fwd_chain,
+            "!",
             "-i",
-            inside,
+            outside,
             "-o",
             outside,
             "-m",
@@ -636,8 +645,9 @@ def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> Non
             "filter",
             "-A",
             fwd_chain,
+            "!",
             "-i",
-            inside,
+            outside,
             "-o",
             outside,
             "-j",
@@ -647,8 +657,7 @@ def _install_gateway_rules(*, inside: str, outside: str, ipset_name: str) -> Non
     )
 
     _LOG.info(
-        "iptables gateway rules installed (inside=%s outside=%s ipset=%s)",
-        inside,
+        "iptables gateway rules installed (outside=%s ipset=%s)",
         outside,
         ipset_name,
     )
@@ -663,25 +672,19 @@ async def _gateway_refresh_loop(
     _ipset_create(ipset_name)
 
     while True:
-        tmp = f"{ipset_name}_tmp"
         try:
-            _ipset_destroy(tmp)
-            _run(["ipset", "create", tmp, "hash:ip"], check=True)
-
             ips = _resolve_allowed_hosts(hosts, nameservers=ns_list)
 
             for ip in sorted(ips):
-                _run(["ipset", "add", tmp, ip, "-exist"], check=True)
-
-            _ipset_swap(tmp, ipset_name)
-            _ipset_destroy(tmp)
+                _ipset_add(ipset_name, ip)
 
             _LOG.info(
-                "Gateway whitelist refreshed: %d IPs for %d hosts", len(ips), len(hosts)
+                "Gateway whitelist refreshed: added %d IPs for %d hosts",
+                len(ips),
+                len(hosts),
             )
         except Exception as e:
             _LOG.warning("Gateway whitelist refresh failed: %s", e)
-            _ipset_destroy(tmp)
 
         await asyncio.sleep(max(1, interval))
 
@@ -696,12 +699,11 @@ async def _run_gateway_mode() -> None:
     ipset_name = os.environ.get("IPSET_NAME", "whitelist")
 
     outside = os.environ.get("OUTSIDE_IFACE") or _detect_outside_iface()
-    inside = os.environ.get("INSIDE_IFACE") or _detect_inside_iface(outside)
 
     try:
         _ensure_ip_forward()
         _ipset_create(ipset_name)
-        _install_gateway_rules(inside=inside, outside=outside, ipset_name=ipset_name)
+        _install_gateway_rules(outside=outside, ipset_name=ipset_name)
     except Exception as e:
         raise SystemExit(
             "Failed to setup gateway mode (iptables/ipset/sysctl). "
@@ -715,7 +717,7 @@ async def _run_gateway_mode() -> None:
         interval,
     )
     _LOG.info("Allowed hosts: %s", " ".join(hosts))
-    _LOG.info("Detected ifaces: inside=%s outside=%s", inside, outside)
+    _LOG.info("Detected iface: outside=%s", outside)
 
     asyncio.create_task(
         _gateway_refresh_loop(hosts, interval=interval, ipset_name=ipset_name)

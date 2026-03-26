@@ -1,6 +1,7 @@
 permissions:
   contents: read
   packages: write
+  pull-requests: write
 
 name: Build, Test & Deploy
 
@@ -41,6 +42,10 @@ jobs:
       DOCKER_IMAGE_NAME: ${{ github.repository }}
       # Push only on non-PR events (push to main/tags, workflow_dispatch)
       PUSH: ${{ toJSON(github.event_name != 'pull_request') }}
+      # Push PR image only for PRs from the same repository
+      PUSH_PR_IMAGE:
+        ${{ toJSON(github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository) }}
     steps:
       # Set up Docker Environment
       - uses: actions/checkout@v4
@@ -89,8 +94,10 @@ jobs:
           echo "Actor: $GITHUB_ACTOR"
           echo "Event: $GITHUB_EVENT_NAME"
           echo "Ref:   $GITHUB_REF"
+          echo "PUSH:  ${{ env.PUSH }}"
+          echo "PR:    ${{ env.PUSH_PR_IMAGE }}"
       - name: Login to GitHub Container Registry
-        if: ${{ fromJSON(env.PUSH) }}
+        if: ${{ fromJSON(env.PUSH) || fromJSON(env.PUSH_PR_IMAGE) }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -125,3 +132,74 @@ jobs:
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
           labels: ${{ steps.docker_meta_public.outputs.labels }}
           tags: ${{ steps.docker_meta_public.outputs.tags }}
+
+      - name: Docker meta for PR image
+        if: ${{ fromJSON(env.PUSH_PR_IMAGE) }}
+        id: docker_meta_pr
+        uses: crazy-max/ghaction-docker-meta@v1
+        with:
+          images: |
+            ghcr.io/tecnativa/docker-whitelist-gateway-service
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number }}
+            type=raw,value=pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+
+      - name: Build and push PR image to GHCR
+        if: ${{ fromJSON(env.PUSH_PR_IMAGE) }}
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: |
+            linux/386
+            linux/amd64
+            linux/arm64
+          load: false
+          push: true
+          provenance: false
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
+          labels: ${{ steps.docker_meta_pr.outputs.labels }}
+          tags: ${{ steps.docker_meta_pr.outputs.tags }}
+
+      - name: Comment PR with test image
+        if: ${{ fromJSON(env.PUSH_PR_IMAGE) }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const image = `ghcr.io/tecnativa/docker-whitelist-gateway-service:pr-${pr}`;
+            const marker = "<!-- pr-test-image-comment -->";
+            const body = `${marker}
+            Test image published:
+            \`${image}\``;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number: pr,
+              per_page: 100,
+            });
+
+            const existing = comments.find(comment =>
+              comment.user?.type === "Bot" &&
+              comment.body?.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: pr,
+                body,
+              });
+            }

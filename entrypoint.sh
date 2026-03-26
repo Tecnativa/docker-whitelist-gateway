@@ -1,163 +1,283 @@
 #!/bin/sh
 set -eu
 
-log() { echo "[entrypoint] $*"; }
-
-
-ip_for_iface() {
-  ip -4 addr show "$1" 2>/dev/null | awk '/inet /{print $2}' | head -n1 | cut -d/ -f1 || true
+log() {
+  echo "[entrypoint] $*"
 }
 
-detect_inside_iface() {
-  outside="$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}' || true)"
+detect_iface_for_gateway() {
+  gw_ip="$1"
+  ip route get "$gw_ip" 2>/dev/null | awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i == "dev") {
+          print $(i + 1)
+          exit
+        }
+      }
+    }
+  '
+}
 
-  ip -o -4 addr show | awk '$2!="lo"{print $2}' | while read -r dev; do
-    [ "$dev" = "$outside" ] && continue
-    echo "$dev"
-    exit 0
+wait_for_gateway_resolution() {
+  gw_name="${GATEWAY_NAME:?missing GATEWAY_NAME}"
+  tries=0
+  while :; do
+    gw_ip="$(getent hosts "$gw_name" | awk '{print $1; exit}')"
+    if [ -n "${gw_ip:-}" ]; then
+      printf '%s\n' "$gw_ip"
+      return 0
+    fi
+    tries=$((tries + 1))
+    if [ "$tries" -gt 60 ]; then
+      echo "ERROR: could not resolve gateway $gw_name" >&2
+      return 1
+    fi
+    sleep 1
   done
-
-  # Fallback
-  echo "eth0"
 }
 
-extract_domains_from_allowed_hosts() {
+write_hosts_from_docker() {
   python3 - <<'PY'
-import ipaddress, os
-raw = os.environ.get("ALLOWED_HOSTS","").strip()
-out=[]
-for tok in raw.split():
-    try:
-        ipaddress.ip_address(tok)
-    except Exception:
-        out.append(tok)
-print(" ".join(out))
+import http.client
+import json
+import os
+import socket
+import sys
+
+SOCK = "/var/run/docker.sock"
+PROJECT = os.environ.get("DOCKER_PROJECT", "").strip()
+PRIMARY_SERVICE = os.environ.get("DOCKER_PRIMARY_SERVICE", "odoo").strip()
+OUTFILE = "/run/dnsmasq-internal.hosts"
+
+if not PROJECT:
+    print("Missing DOCKER_PROJECT", file=sys.stderr)
+    sys.exit(1)
+
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, unix_socket_path, host="docker"):
+        super().__init__(host)
+        self.unix_socket_path = unix_socket_path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(self.unix_socket_path)
+
+
+def docker_get(path: str):
+    conn = UnixHTTPConnection(SOCK)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read()
+    status = resp.status
+    reason = resp.reason
+    conn.close()
+
+    if status != 200:
+        raise RuntimeError(f"Docker API error on {path}: {status} {reason}")
+
+    return json.loads(body.decode("utf-8"))
+
+
+containers = docker_get("/v1.41/containers/json")
+project_containers = [
+    c for c in containers
+    if (c.get("Labels") or {}).get("com.docker.compose.project") == PROJECT
+]
+
+if not project_containers:
+    raise RuntimeError(f"No running containers found for project {PROJECT}")
+
+primary_container = None
+for c in project_containers:
+    if (c.get("Labels") or {}).get("com.docker.compose.service") == PRIMARY_SERVICE:
+        primary_container = c
+        break
+
+if not primary_container:
+    raise RuntimeError(
+        f"Could not find primary service {PRIMARY_SERVICE} in project {PROJECT}"
+    )
+
+primary_inspect = docker_get(f"/v1.41/containers/{primary_container['Id']}/json")
+primary_networks = set(
+    (primary_inspect.get("NetworkSettings", {}).get("Networks") or {}).keys()
+)
+
+lines = []
+seen = set()
+
+for c in project_containers:
+    inspect = docker_get(f"/v1.41/containers/{c['Id']}/json")
+    labels = inspect.get("Config", {}).get("Labels") or {}
+    service = labels.get("com.docker.compose.service")
+    cname = inspect.get("Name", "").lstrip("/")
+    networks = inspect.get("NetworkSettings", {}).get("Networks") or {}
+
+    for net_name, net_cfg in networks.items():
+        if net_name not in primary_networks:
+            continue
+
+        ip = (net_cfg or {}).get("IPAddress")
+        if not ip:
+            continue
+
+        names = set()
+        if service:
+            names.add(service)
+        if cname:
+            names.add(cname)
+
+        for alias in (net_cfg.get("Aliases") or []):
+            if alias:
+                names.add(alias)
+
+        for name in sorted(names):
+            key = (ip, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"{ip} {name}")
+
+content = "\n".join(sorted(lines)) + ("\n" if lines else "")
+
+old = ""
+try:
+    with open(OUTFILE, "r", encoding="utf-8") as f:
+        old = f.read()
+except FileNotFoundError:
+    pass
+
+if old != content:
+    with open(OUTFILE, "w", encoding="utf-8") as f:
+        f.write(content)
 PY
 }
 
-write_hosts_for_internal_names() {
-  names="${1:-}"
-  [ -n "$names" ] || return 0
-
-  for name in $names; do
-    ip="$(getent hosts "$name" 2>/dev/null | awk '{print $1}' | head -n 1 || true)"
-    if [ -n "$ip" ]; then
-      if ! grep -qE "^[[:space:]]*$ip[[:space:]]+$name([[:space:]]|$)" /etc/hosts; then
-        echo "$ip $name" >> /etc/hosts
-      fi
+refresh_hosts_from_docker_loop() {
+  : "${DNS_DOCKER_REFRESH_INTERVAL:=5}"
+  while :; do
+    if ! write_hosts_from_docker; then
+      echo "WARN: failed to refresh internal DNS hosts from Docker" >&2
     fi
-  done
+    if [ -f /run/dnsmasq.pid ]; then
+      kill -HUP "$(cat /run/dnsmasq.pid)" 2>/dev/null || true
+    fi
+    sleep "$DNS_DOCKER_REFRESH_INTERVAL"
+  done &
 }
 
-start_dnsmasq() {
-  : "${DNS_UPSTREAMS:=1.1.1.1 8.8.8.8}"
-  : "${DNS_INTERNAL_NAMES:=db smtp wdb pgweb odoo proxy_general}"
-  : "${DNS_ALLOWED_DOMAINS:=}"
-  : "${DNS_LISTEN_IFACE:=}"
+extract_domains_from_allowed_hosts() {
+  for item in ${ALLOWED_HOSTS:-}; do
+    case "$item" in
+      "") ;;
+      *[!0-9.]*) printf '%s\n' "$item" ;;
+    esac
+  done | sort -u | xargs
+}
 
-  # Default listen iface: INSIDE_IFACE if present, else eth0
-    # Auto-detect listen iface (inside) if not provided
-  if [ -z "$DNS_LISTEN_IFACE" ]; then
-    DNS_LISTEN_IFACE="$(detect_inside_iface)"
-  fi
+start_dnsmasq_local() {
+  : "${DNS_UPSTREAMS_LOCAL:=127.0.0.11}"
 
-  # If not provided, derive allowed domains from ALLOWED_HOSTS (filter IP literals out)
-  if [ -z "$DNS_ALLOWED_DOMAINS" ]; then
-    DNS_ALLOWED_DOMAINS="$(extract_domains_from_allowed_hosts)"
-  fi
+  mkdir -p /run
+  touch /run/dnsmasq-internal.hosts
 
-  log "dnsmasq: listen iface=$DNS_LISTEN_IFACE (ip=$(ip_for_iface "$DNS_LISTEN_IFACE"))"
-  log "dnsmasq: upstreams=$DNS_UPSTREAMS"
-  log "dnsmasq: allowed domains=$DNS_ALLOWED_DOMAINS"
-  log "dnsmasq: internal names=$DNS_INTERNAL_NAMES"
-
-  # Ensure internal docker service names are resolvable via /etc/hosts (dnsmasq reads hosts)
-  write_hosts_for_internal_names "$DNS_INTERNAL_NAMES"
+  log "local dnsmasq: upstreams=$DNS_UPSTREAMS_LOCAL"
 
   cat > /etc/dnsmasq.conf <<EOF
 no-resolv
-domain-needed
 bogus-priv
 cache-size=1000
 filter-AAAA
-
-# Default: block everything NXDOMAIN
+bind-interfaces
+listen-address=127.0.0.1
+addn-hosts=/run/dnsmasq-internal.hosts
+clear-on-reload
 EOF
 
-  for domain in $DNS_ALLOWED_DOMAINS; do
-    for ns in $DNS_UPSTREAMS; do
-      echo "server=/$domain/$ns" >> /etc/dnsmasq.conf
-    done
+  for ns in $DNS_UPSTREAMS_LOCAL; do
+    echo "server=$ns" >> /etc/dnsmasq.conf
   done
 
-  dnsmasq -k -C /etc/dnsmasq.conf >/dev/null 2>&1 &
-  log "dnsmasq started"
+  dnsmasq -k -C /etc/dnsmasq.conf -x /run/dnsmasq.pid >/dev/null 2>&1 &
+  log "local dnsmasq started on 127.0.0.1:53"
 }
 
 net_setup_mode() {
-  set -eu
-  : "${GATEWAY_NAME:?Missing GATEWAY_NAME}"
-
   echo "INFO: net_setup_mode: waiting for gateway DNS..."
-
-  # Wait until gateway resolves
-  for i in $(seq 1 30); do
-    GW_IP="$(getent ahostsv4 "$GATEWAY_NAME" | awk '{print $1; exit}' || true)"
-    [ -n "$GW_IP" ] && break
-    sleep 3
-  done
-
-  if [ -z "${GW_IP:-}" ]; then
-    echo "ERROR: cannot resolve $GATEWAY_NAME"
-    exit 1
-  fi
-
+  GW_IP="$(wait_for_gateway_resolution)"
   echo "INFO: gateway resolved to $GW_IP"
 
-  # Wait until gateway answers ping (network ready)
-  for i in $(seq 1 30); do
-    if ping -c1 -W1 "$GW_IP" >/dev/null 2>&1; then
-      break
-    fi
-    echo "INFO: waiting for gateway network readiness..."
-    sleep 3
-  done
-
   echo "INFO: selecting correct iface for gateway..."
-
-  # Detect iface used to reach gateway
-  ODOO_DEV="$(ip -4 route get "$GW_IP" | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-
+  ODOO_DEV="$(detect_iface_for_gateway "$GW_IP")"
   if [ -z "${ODOO_DEV:-}" ]; then
-    echo "ERROR: could not detect interface to reach gateway"
+    echo "ERROR: could not determine iface for gateway $GW_IP" >&2
     exit 1
   fi
-
   echo "INFO: chosen iface=$ODOO_DEV"
 
   ip route replace default via "$GW_IP" dev "$ODOO_DEV"
 
-  {
-  echo "nameserver $GW_IP"
-  echo "options ndots:0"
-  } > /etc/resolv.conf
+  if [ "${DNS_LOCAL:-0}" = "1" ]; then
+    if [ "${DNS_INTERNAL_FROM_DOCKER:-0}" = "1" ]; then
+      echo "INFO: generating internal DNS hosts from Docker..."
+      if ! write_hosts_from_docker; then
+        echo "ERROR: failed to generate internal DNS hosts from Docker" >&2
+        exit 1
+      fi
+    fi
 
-  echo "INFO: default route and DNS configured successfully"
+    start_dnsmasq_local
 
-  # Keep container alive without busy looping
+    if [ "${DNS_INTERNAL_FROM_DOCKER:-0}" = "1" ]; then
+      refresh_hosts_from_docker_loop
+    fi
+
+    {
+      echo "nameserver 127.0.0.1"
+      echo "options ndots:0"
+    } > /etc/resolv.conf
+
+    echo "INFO: default route configured and local DNS enabled"
+  else
+    {
+      echo "nameserver $GW_IP"
+      echo "options ndots:0"
+    } > /etc/resolv.conf
+
+    echo "INFO: default route and gateway DNS configured successfully"
+  fi
+
   tail -f /dev/null
 }
 
-: "${MODE_RUN:=gateway}"
+proxy_mode() {
+  # La imagen tiene CMD ["proxy"], así que quitamos ese argumento
+  # para no pasarlo dos veces al script Python.
+  if [ "${1:-}" = "proxy" ]; then
+    shift
+  fi
 
-if [ "$MODE_RUN" = "net_setup" ]; then
-  net_setup_mode
-fi
+  exec /usr/local/bin/proxy "$@"
+}
 
-# Gateway mode: optionally start dnsmasq before running proxy
-: "${DNS_ENABLED:=1}"
-if [ "$DNS_ENABLED" != "0" ]; then
-  start_dnsmasq
-fi
+main() {
+  case "${MODE_RUN:-gateway}" in
+    net_setup)
+      net_setup_mode
+      ;;
+    gateway|"")
+      proxy_mode "$@"
+      ;;
+    legacy|tcp|proxy)
+      proxy_mode "$@"
+      ;;
+    *)
+      echo "Unknown MODE_RUN=${MODE_RUN:-}" >&2
+      exit 1
+      ;;
+  esac
+}
 
-exec "$@"
+main "$@"

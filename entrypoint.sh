@@ -46,13 +46,7 @@ import socket
 import sys
 
 SOCK = "/var/run/docker.sock"
-PROJECT = os.environ.get("DOCKER_PROJECT", "").strip()
-PRIMARY_SERVICE = os.environ.get("DOCKER_PRIMARY_SERVICE", "odoo").strip()
 OUTFILE = "/run/dnsmasq-internal.hosts"
-
-if not PROJECT:
-    print("Missing DOCKER_PROJECT", file=sys.stderr)
-    sys.exit(1)
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -80,35 +74,49 @@ def docker_get(path: str):
     return json.loads(body.decode("utf-8"))
 
 
+def get_self_container_id() -> str:
+    # In Docker, the hostname is usually the container ID (or a valid prefix).
+    with open("/etc/hostname", "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def resolve_primary_container_id(self_inspect: dict) -> str:
+    netmode = ((self_inspect.get("HostConfig") or {}).get("NetworkMode") or "").strip()
+
+    # In net_setup mode we expect something like: container:<odoo_container_id>
+    if netmode.startswith("container:"):
+        return netmode.split(":", 1)[1].strip()
+
+    # Fallback: if for some reason we are already inspecting the primary container,
+    # just use self.
+    return self_inspect["Id"]
+
+
+def get_default_network_names(primary_inspect: dict) -> list[str]:
+    networks = (primary_inspect.get("NetworkSettings", {}).get("Networks") or {}).keys()
+    default_networks = [name for name in networks if name == "default" or name.endswith("_default")]
+
+    if not default_networks:
+        raise RuntimeError(
+            "Could not determine the primary default network from the main container"
+        )
+
+    return sorted(default_networks)
+
+
+self_id = get_self_container_id()
+self_inspect = docker_get(f"/v1.41/containers/{self_id}/json")
+primary_id = resolve_primary_container_id(self_inspect)
+primary_inspect = docker_get(f"/v1.41/containers/{primary_id}/json")
+
+default_network_names = get_default_network_names(primary_inspect)
+
 containers = docker_get("/v1.41/containers/json")
-project_containers = [
-    c for c in containers
-    if (c.get("Labels") or {}).get("com.docker.compose.project") == PROJECT
-]
-
-if not project_containers:
-    raise RuntimeError(f"No running containers found for project {PROJECT}")
-
-primary_container = None
-for c in project_containers:
-    if (c.get("Labels") or {}).get("com.docker.compose.service") == PRIMARY_SERVICE:
-        primary_container = c
-        break
-
-if not primary_container:
-    raise RuntimeError(
-        f"Could not find primary service {PRIMARY_SERVICE} in project {PROJECT}"
-    )
-
-primary_inspect = docker_get(f"/v1.41/containers/{primary_container['Id']}/json")
-primary_networks = set(
-    (primary_inspect.get("NetworkSettings", {}).get("Networks") or {}).keys()
-)
 
 lines = []
 seen = set()
 
-for c in project_containers:
+for c in containers:
     inspect = docker_get(f"/v1.41/containers/{c['Id']}/json")
     labels = inspect.get("Config", {}).get("Labels") or {}
     service = labels.get("com.docker.compose.service")
@@ -116,7 +124,7 @@ for c in project_containers:
     networks = inspect.get("NetworkSettings", {}).get("Networks") or {}
 
     for net_name, net_cfg in networks.items():
-        if net_name not in primary_networks:
+        if net_name not in default_network_names:
             continue
 
         ip = (net_cfg or {}).get("IPAddress")

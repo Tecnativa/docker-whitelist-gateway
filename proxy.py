@@ -62,6 +62,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _get_allowed_hosts():
+    allowed_hosts = " ".join(
+        value.strip()
+        for key, value in os.environ.items()
+        if key.startswith("ALLOWED_HOSTS")
+    )
+    return allowed_hosts
+
+
 def _run(
     cmd: List[str], *, check: bool = True, capture: bool = False
 ) -> subprocess.CompletedProcess:
@@ -690,7 +699,7 @@ async def _gateway_refresh_loop(
 
 
 async def _run_gateway_mode() -> None:
-    raw_hosts = os.environ.get("ALLOWED_HOSTS", "").strip()
+    raw_hosts = _get_allowed_hosts()
     if not raw_hosts:
         raise SystemExit("Gateway mode requires ALLOWED_HOSTS.")
 
@@ -727,7 +736,7 @@ async def _run_gateway_mode() -> None:
 
 async def _main() -> None:
     target = os.environ.get("TARGET")
-    allowed_hosts = os.environ.get("ALLOWED_HOSTS", "").strip()
+    allowed_hosts = _get_allowed_hosts()
 
     if target:
         await _run_legacy_forwarder_mode()

@@ -159,14 +159,17 @@ sysctls:
 
 ### Common
 
-#### `ALLOWED_HOSTS` (required)
+#### `ALLOWED_HOSTS*` (required)
 
-Space-separated list of allowed external domains and/or IPs.
+Space-separated list of allowed external domains and/or IPs. All vars starting with
+ALLOWED_HOSTS will be merged, this way you can have a common env file for hosts shared
+across projects.
 
 Example:
 
 ```yaml
 ALLOWED_HOSTS: "api.partner.invalid files.vendor.invalid 203.0.113.25"
+ALLOWED_HOSTS_GLOBAL: "service.example.com"
 ```
 
 Notes:

@@ -16,6 +16,7 @@ services:
       context: ..
       labels:
         - "AUTOHEAL_${COMPOSE_PROJECT_NAME}=true"
+    cap_add: [NET_ADMIN]
     depends_on:
       - target
       - autoheal
@@ -33,7 +34,7 @@ services:
     healthcheck:
       test: ["CMD", "healthcheck"]
       interval: 1s
-      timeout: 1s
+      timeout: 3s
       retries: 0
       start_period: 5s
     restart: unless-stopped
@@ -44,6 +45,7 @@ services:
       context: ..
       labels:
         - "AUTOHEAL_${COMPOSE_PROJECT_NAME}=true"
+    cap_add: [NET_ADMIN]
     depends_on:
       - target
       - autoheal
@@ -58,11 +60,11 @@ services:
       PRE_RESOLVE: 0
       NAMESERVERS: "127.0.0.11" #use local docker nameserver
       HTTP_HEALTHCHECK: 1
-      HTTP_HEALTHCHECK_TIMEOUT_MS: 200
+      HTTP_HEALTHCHECK_TIMEOUT_MS: 2000
     healthcheck:
       test: ["CMD", "healthcheck"]
       interval: 1s
-      timeout: 1s
+      timeout: 3s
       retries: 0
       start_period: 1s
     restart: unless-stopped
@@ -73,6 +75,7 @@ services:
       context: ..
       labels:
         - "AUTOHEAL_${COMPOSE_PROJECT_NAME}=true"
+    cap_add: [NET_ADMIN]
     depends_on:
       - target_smtp
       - autoheal
@@ -94,7 +97,7 @@ services:
     healthcheck:
       test: ["CMD", "healthcheck"]
       interval: 1s
-      timeout: 1s
+      timeout: 3s
       retries: 0
       start_period: 1s
     restart: unless-stopped

@@ -17,7 +17,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--image",
         action="store",
-        default="test:docker-whitelist",
+        default="test:docker-whitelist-gateway",
         help="Specify testing image name",
     )
 
@@ -56,8 +56,10 @@ def container_factory(image):
                 "container",
                 "run",
                 "--detach",
+                "--cap-add",
+                "NET_ADMIN",
                 "-e",
-                "TARGET=%s" % target,
+                f"TARGET={target}",
                 image,
             ).strip()
             with local.env():

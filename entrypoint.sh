@@ -42,6 +42,7 @@ write_hosts_from_docker() {
 import http.client
 import json
 import os
+import re
 import socket
 import sys
 
@@ -75,7 +76,30 @@ def docker_get(path: str):
 
 
 def get_self_container_id() -> str:
-    # In Docker, the hostname is usually the container ID (or a valid prefix).
+    # /etc/hostname is NOT reliable here: when this container shares the
+    # network namespace of another one (network_mode: container:X /
+    # service:X in Compose) and that other container was started with a
+    # custom `hostname`, Docker applies that same hostname to us too, so
+    # /etc/hostname is no longer our own container ID.
+    #
+    # The bind-mount Docker sets up for /etc/hostname always exposes
+    # /var/lib/docker/containers/<our real id>/hostname, regardless of
+    # storage driver or hostname overrides, so read our id from there via
+    # /proc/self/mountinfo instead.
+    with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+        for line in f:
+            fields = line.strip().split(" - ", 1)[0].split()
+            if len(fields) < 5:
+                continue
+            mount_root, mount_point = fields[3], fields[4]
+            if mount_point != "/etc/hostname":
+                continue
+            match = re.search(r"/containers/([0-9a-f]{12,64})/hostname$", mount_root)
+            if match:
+                return match.group(1)
+
+    # Fallback for setups without that bind-mount: the hostname is usually
+    # the container ID.
     with open("/etc/hostname", "r", encoding="utf-8") as f:
         return f.read().strip()
 

@@ -42,6 +42,7 @@ write_hosts_from_docker() {
 import http.client
 import json
 import os
+import re
 import socket
 import sys
 
@@ -75,7 +76,30 @@ def docker_get(path: str):
 
 
 def get_self_container_id() -> str:
-    # In Docker, the hostname is usually the container ID (or a valid prefix).
+    # /etc/hostname is NOT reliable here: when this container shares the
+    # network namespace of another one (network_mode: container:X /
+    # service:X in Compose) and that other container was started with a
+    # custom `hostname`, Docker applies that same hostname to us too, so
+    # /etc/hostname is no longer our own container ID.
+    #
+    # The bind-mount Docker sets up for /etc/hostname always exposes
+    # /var/lib/docker/containers/<our real id>/hostname, regardless of
+    # storage driver or hostname overrides, so read our id from there via
+    # /proc/self/mountinfo instead.
+    with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+        for line in f:
+            fields = line.strip().split(" - ", 1)[0].split()
+            if len(fields) < 5:
+                continue
+            mount_root, mount_point = fields[3], fields[4]
+            if mount_point != "/etc/hostname":
+                continue
+            match = re.search(r"/containers/([0-9a-f]{12,64})/hostname$", mount_root)
+            if match:
+                return match.group(1)
+
+    # Fallback for setups without that bind-mount: the hostname is usually
+    # the container ID.
     with open("/etc/hostname", "r", encoding="utf-8") as f:
         return f.read().strip()
 
@@ -105,19 +129,23 @@ def get_default_network_names(primary_inspect: dict) -> list[str]:
 
 
 self_id = get_self_container_id()
-self_inspect = docker_get(f"/v1.41/containers/{self_id}/json")
+# Deliberately unversioned: a hardcoded API version (e.g. /v1.41/) breaks as
+# soon as the Docker Engine raises its minimum supported API version past
+# it (newer engines reject old versions with 400 Bad Request). Omitting the
+# version makes the daemon use its own latest supported version instead.
+self_inspect = docker_get(f"/containers/{self_id}/json")
 primary_id = resolve_primary_container_id(self_inspect)
-primary_inspect = docker_get(f"/v1.41/containers/{primary_id}/json")
+primary_inspect = docker_get(f"/containers/{primary_id}/json")
 
 default_network_names = get_default_network_names(primary_inspect)
 
-containers = docker_get("/v1.41/containers/json")
+containers = docker_get("/containers/json")
 
 lines = []
 seen = set()
 
 for c in containers:
-    inspect = docker_get(f"/v1.41/containers/{c['Id']}/json")
+    inspect = docker_get(f"/containers/{c['Id']}/json")
     labels = inspect.get("Config", {}).get("Labels") or {}
     service = labels.get("com.docker.compose.service")
     cname = inspect.get("Name", "").lstrip("/")

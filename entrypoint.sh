@@ -129,19 +129,23 @@ def get_default_network_names(primary_inspect: dict) -> list[str]:
 
 
 self_id = get_self_container_id()
-self_inspect = docker_get(f"/v1.41/containers/{self_id}/json")
+# Deliberately unversioned: a hardcoded API version (e.g. /v1.41/) breaks as
+# soon as the Docker Engine raises its minimum supported API version past
+# it (newer engines reject old versions with 400 Bad Request). Omitting the
+# version makes the daemon use its own latest supported version instead.
+self_inspect = docker_get(f"/containers/{self_id}/json")
 primary_id = resolve_primary_container_id(self_inspect)
-primary_inspect = docker_get(f"/v1.41/containers/{primary_id}/json")
+primary_inspect = docker_get(f"/containers/{primary_id}/json")
 
 default_network_names = get_default_network_names(primary_inspect)
 
-containers = docker_get("/v1.41/containers/json")
+containers = docker_get("/containers/json")
 
 lines = []
 seen = set()
 
 for c in containers:
-    inspect = docker_get(f"/v1.41/containers/{c['Id']}/json")
+    inspect = docker_get(f"/containers/{c['Id']}/json")
     labels = inspect.get("Config", {}).get("Labels") or {}
     service = labels.get("com.docker.compose.service")
     cname = inspect.get("Name", "").lstrip("/")
